@@ -10,6 +10,10 @@
 (define-constant ERR_PAYMENT_FAILED (err u108))
 (define-constant ERR_BREACH_ALREADY_REPORTED (err u109))
 (define-constant ERR_INVALID_PENALTY (err u110))
+(define-constant ERR_VESTING_NOT_FOUND (err u111))
+(define-constant ERR_CLIFF_NOT_REACHED (err u112))
+(define-constant ERR_NO_VESTED_AMOUNT (err u113))
+(define-constant ERR_INVALID_VESTING_PARAMS (err u114))
 
 (define-constant STATUS_ACTIVE u1)
 (define-constant STATUS_COMPLETED u2)
@@ -70,6 +74,20 @@
   uint
   uint
 )
+
+(define-map vesting-schedules
+  uint
+  {
+    agreement-id: uint,
+    total-amount: uint,
+    cliff-blocks: uint,
+    vesting-blocks: uint,
+    start-block: uint,
+    withdrawn-amount: uint
+  }
+)
+
+(define-data-var next-vesting-id uint u1)
 
 (define-public (create-agreement
   (employee principal)
@@ -359,4 +377,106 @@
 
 (define-read-only (get-contract-owner)
   (var-get contract-owner)
+)
+
+(define-public (create-vesting-schedule
+  (agreement-id uint)
+  (total-amount uint)
+  (cliff-blocks uint)
+  (vesting-blocks uint)
+)
+  (let
+    (
+      (agreement (unwrap! (map-get? employment-agreements agreement-id) ERR_AGREEMENT_NOT_FOUND))
+      (vesting-id (var-get next-vesting-id))
+      (start-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get employer agreement)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status agreement) STATUS_ACTIVE) ERR_AGREEMENT_TERMINATED)
+    (asserts! (> total-amount u0) ERR_INVALID_VESTING_PARAMS)
+    (asserts! (> vesting-blocks u0) ERR_INVALID_VESTING_PARAMS)
+    (asserts! (< cliff-blocks vesting-blocks) ERR_INVALID_VESTING_PARAMS)
+    
+    (map-set vesting-schedules vesting-id
+      {
+        agreement-id: agreement-id,
+        total-amount: total-amount,
+        cliff-blocks: cliff-blocks,
+        vesting-blocks: vesting-blocks,
+        start-block: start-block,
+        withdrawn-amount: u0
+      }
+    )
+    
+    (var-set next-vesting-id (+ vesting-id u1))
+    (ok vesting-id)
+  )
+)
+
+(define-public (withdraw-vested-amount (vesting-id uint))
+  (let
+    (
+      (vesting (unwrap! (map-get? vesting-schedules vesting-id) ERR_VESTING_NOT_FOUND))
+      (agreement-id (get agreement-id vesting))
+      (agreement (unwrap! (map-get? employment-agreements agreement-id) ERR_AGREEMENT_NOT_FOUND))
+      (vested-amount (unwrap! (calculate-vested-amount vesting-id) ERR_NO_VESTED_AMOUNT))
+      (withdrawable (- vested-amount (get withdrawn-amount vesting)))
+    )
+    (asserts! (is-eq tx-sender (get employee agreement)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status agreement) STATUS_ACTIVE) ERR_AGREEMENT_TERMINATED)
+    (asserts! (> withdrawable u0) ERR_NO_VESTED_AMOUNT)
+    
+    (map-set vesting-schedules vesting-id
+      (merge vesting {
+        withdrawn-amount: (+ (get withdrawn-amount vesting) withdrawable)
+      })
+    )
+    
+    (try! (stx-transfer? withdrawable (get employer agreement) (get employee agreement)))
+    (ok withdrawable)
+  )
+)
+
+(define-read-only (calculate-vested-amount (vesting-id uint))
+  (match (map-get? vesting-schedules vesting-id)
+    vesting (let
+      (
+        (current-block stacks-block-height)
+        (start-block (get start-block vesting))
+        (cliff-end (+ start-block (get cliff-blocks vesting)))
+        (vesting-end (+ start-block (get vesting-blocks vesting)))
+        (total-amount (get total-amount vesting))
+      )
+      (if (< current-block cliff-end)
+        (ok u0)
+        (if (>= current-block vesting-end)
+          (ok total-amount)
+          (let
+            (
+              (elapsed-blocks (- current-block start-block))
+              (total-vesting-blocks (get vesting-blocks vesting))
+              (vested (/ (* total-amount elapsed-blocks) total-vesting-blocks))
+            )
+            (ok vested)
+          )
+        )
+      )
+    )
+    ERR_VESTING_NOT_FOUND
+  )
+)
+
+(define-read-only (get-vesting-schedule (vesting-id uint))
+  (map-get? vesting-schedules vesting-id)
+)
+
+(define-read-only (get-withdrawable-amount (vesting-id uint))
+  (let
+    (
+      (vesting (unwrap! (map-get? vesting-schedules vesting-id) ERR_VESTING_NOT_FOUND))
+      (vested-amount (unwrap! (calculate-vested-amount vesting-id) ERR_NO_VESTED_AMOUNT))
+      (withdrawable (- vested-amount (get withdrawn-amount vesting)))
+    )
+    (ok withdrawable)
+  )
 )
