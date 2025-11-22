@@ -14,6 +14,9 @@
 (define-constant ERR_CLIFF_NOT_REACHED (err u112))
 (define-constant ERR_NO_VESTED_AMOUNT (err u113))
 (define-constant ERR_INVALID_VESTING_PARAMS (err u114))
+(define-constant ERR_REVIEW_NOT_FOUND (err u115))
+(define-constant ERR_INVALID_SCORE (err u116))
+(define-constant ERR_REVIEW_ALREADY_EXISTS (err u117))
 
 (define-constant STATUS_ACTIVE u1)
 (define-constant STATUS_COMPLETED u2)
@@ -23,6 +26,12 @@
 (define-constant MILESTONE_PENDING u1)
 (define-constant MILESTONE_COMPLETED u2)
 (define-constant MILESTONE_DISPUTED u3)
+
+(define-constant REVIEW_POOR u1)
+(define-constant REVIEW_BELOW_AVERAGE u2)
+(define-constant REVIEW_AVERAGE u3)
+(define-constant REVIEW_ABOVE_AVERAGE u4)
+(define-constant REVIEW_EXCELLENT u5)
 
 (define-data-var next-agreement-id uint u1)
 (define-data-var contract-owner principal tx-sender)
@@ -89,6 +98,22 @@
 
 (define-data-var next-vesting-id uint u1)
 
+(define-map performance-reviews
+  { agreement-id: uint, review-id: uint }
+  {
+    reviewer: principal,
+    score: uint,
+    feedback: (string-ascii 300),
+    review-block: uint,
+    bonus-adjustment: uint
+  }
+)
+
+(define-map review-counter
+  uint
+  uint
+)
+
 (define-public (create-agreement
   (employee principal)
   (base-salary uint)
@@ -123,6 +148,7 @@
     
     (map-set milestone-counter agreement-id u0)
     (map-set breach-counter agreement-id u0)
+    (map-set review-counter agreement-id u0)
     (var-set next-agreement-id (+ agreement-id u1))
     
     (ok agreement-id)
@@ -478,5 +504,82 @@
       (withdrawable (- vested-amount (get withdrawn-amount vesting)))
     )
     (ok withdrawable)
+  )
+)
+
+(define-public (submit-performance-review
+  (agreement-id uint)
+  (score uint)
+  (feedback (string-ascii 300))
+)
+  (let
+    (
+      (agreement (unwrap! (map-get? employment-agreements agreement-id) ERR_AGREEMENT_NOT_FOUND))
+      (review-id (+ (default-to u0 (map-get? review-counter agreement-id)) u1))
+      (bonus-adjustment (calculate-bonus-adjustment (get base-salary agreement) score))
+    )
+    (asserts! (is-eq tx-sender (get employer agreement)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status agreement) STATUS_ACTIVE) ERR_AGREEMENT_TERMINATED)
+    (asserts! (and (>= score u1) (<= score u5)) ERR_INVALID_SCORE)
+    
+    (map-set performance-reviews
+      { agreement-id: agreement-id, review-id: review-id }
+      {
+        reviewer: tx-sender,
+        score: score,
+        feedback: feedback,
+        review-block: stacks-block-height,
+        bonus-adjustment: bonus-adjustment
+      }
+    )
+    
+    (map-set employment-agreements agreement-id
+      (merge agreement {
+        bonus-pool: (+ (get bonus-pool agreement) bonus-adjustment)
+      })
+    )
+    
+    (map-set review-counter agreement-id review-id)
+    (ok review-id)
+  )
+)
+
+(define-read-only (calculate-bonus-adjustment (base-salary uint) (score uint))
+  (let
+    (
+      (multiplier (if (is-eq score REVIEW_POOR)
+                    u0
+                    (if (is-eq score REVIEW_BELOW_AVERAGE)
+                      u5
+                      (if (is-eq score REVIEW_AVERAGE)
+                        u10
+                        (if (is-eq score REVIEW_ABOVE_AVERAGE)
+                          u20
+                          u30)))))
+    )
+    (/ (* base-salary multiplier) u100)
+  )
+)
+
+(define-read-only (get-performance-review (agreement-id uint) (review-id uint))
+  (map-get? performance-reviews { agreement-id: agreement-id, review-id: review-id })
+)
+
+(define-read-only (get-review-count (agreement-id uint))
+  (default-to u0 (map-get? review-counter agreement-id))
+)
+
+(define-read-only (get-latest-performance-score (agreement-id uint))
+  (let
+    (
+      (total-reviews (get-review-count agreement-id))
+    )
+    (if (is-eq total-reviews u0)
+      (ok u0)
+      (match (get-performance-review agreement-id total-reviews)
+        review (ok (get score review))
+        (ok u0)
+      )
+    )
   )
 )
